@@ -12,17 +12,21 @@ const MIN_VISIBLE_MS = 10000
 // …and always shows "Done" for at least this long before closing.
 const DONE_LINGER_MS = 4000
 
-// Gruvbox dark
-const THEME = {
-  cardBg: '#282828',
-  textPrimary: '#ebdbb2',
-  textSecondary: '#a89984',
-  accent: '#458588',
-  done: '#98971a',
-  stale: '#d79921',
-  track: 'rgba(235, 235, 245, 0.15)',
-  radius: '22px',
-  shadow: '0 0 15px #92837436',
+const RADIUS = '22px'
+
+// Colors follow the global theme index (~/.config/themes) when there is one: 'system' uses
+// the theme apps set to "System" show for the current macOS appearance; a theme id pins
+// one. The theme is read when the widget starts; to follow a theme switch, reload the
+// widget (`reload widget id "job-overview-widget-index-jsx"`, e.g. from a theme
+// switcher's hook). The last theme survives the reload, so the cards fade into the new one.
+const THEME_CHOICE = 'system'
+// Without a theme index (Gruvbox dark), and for roles a theme doesn't resolve.
+const FALLBACK_THEME = {
+  variant: 'dark',
+  roles: {
+    bg: '#282828', fg: '#ebdbb2', 'fg-muted': '#a89984', 'fg-subtle': '#928374',
+    accent: '#458588', success: '#98971a', warning: '#d79921',
+  },
 }
 
 // ─── Internals ───────────────────────────────────────────────────────────────
@@ -33,7 +37,84 @@ const RETRY_MIN_MS = 1000
 const RETRY_MAX_MS = 2000 // localhost: retrying is cheap, and a fresh server shouldn't miss quick jobs
 const TICK_MS = 1000 // keeps "closing in 5s" / "stale for 3m" current
 
-export const refreshFrequency = false
+// ─── Theme ───────────────────────────────────────────────────────────────────
+
+// Card variable -> theme role.
+const ROLES = {
+  'card-bg': 'bg', text: 'fg', 'text-2': 'fg-muted', accent: 'accent', done: 'success', stale: 'warning',
+}
+// Role -> palette slot when roles.json is missing (the index's documented defaults).
+const ROLE_DEFAULTS = {
+  bg: 'base00', fg: 'base05', 'fg-muted': 'base04', 'fg-subtle': 'base03', accent: 'base0D',
+  success: 'base0B', warning: 'base0A',
+}
+
+// Picks the theme in the shell, so only one scheme file is read, and prints it after a
+// marker. $HOME and friends are expanded by the shell that runs the command.
+export const command = `
+a=light; [ "$(defaults read -g AppleInterfaceStyle 2>/dev/null)" = Dark ] && a=dark
+t=$HOME/.config/themes; [ -n "$XDG_CONFIG_HOME" ] && t=$XDG_CONFIG_HOME/themes
+[ -n "$THEMES_DIR" ] && t=$THEMES_DIR
+s=$HOME/.local/state/themes; [ -n "$XDG_STATE_HOME" ] && s=$XDG_STATE_HOME/themes
+[ -n "$THEMES_STATE_DIR" ] && s=$THEMES_STATE_DIR
+[ -d "$t/schemes" ] || exit 0
+id='${THEME_CHOICE}'; [ -f "$t/schemes/$id.json" ] || id=
+for f in "$s/current.json" "$t/defaults.json"; do
+  [ -n "$id" ] && break
+  id=$(plutil -extract "$a" raw -o - "$f" 2>/dev/null); [ -f "$t/schemes/$id.json" ] || id=
+done
+[ -n "$id" ] || id=$(ls "$t/schemes" | sed -n 's/\\.json$//p' | head -n 1)
+[ -n "$id" ] || exit 0
+echo "--tov:theme-- $id"
+cat "$t/schemes/$id.json"
+echo
+echo "--tov:roles--"
+cat "$t/roles.json" 2>/dev/null
+`
+export const refreshFrequency = false // runs once per (re)load; jobs arrive over the socket
+
+// The theme from the command output, or null (no index, or a half-written file: the
+// widget keeps the last good theme).
+const parseTheme = (output) => {
+  const text = String(output || '')
+  const at = text.indexOf('--tov:theme--')
+  if (at === -1) return null
+  const headEnd = text.indexOf('\n', at)
+  const rolesAt = text.indexOf('\n--tov:roles--', at)
+  try {
+    const scheme = JSON.parse(text.slice(headEnd + 1, rolesAt === -1 ? undefined : rolesAt))
+    let roleMap = {}
+    try {
+      if (rolesAt !== -1) roleMap = JSON.parse(text.slice(text.indexOf('\n', rolesAt + 1) + 1))
+    } catch (e) {
+      /* no or broken roles.json: the documented defaults apply */
+    }
+    const mapping = { ...ROLE_DEFAULTS, ...roleMap, ...(scheme.roles || {}) }
+    const roles = {}
+    for (const [role, ref] of Object.entries(mapping)) {
+      const color = typeof ref !== 'string' ? null : ref.startsWith('#') ? ref : scheme.palette[ref]
+      if (color) roles[role] = color
+    }
+    return { variant: scheme.variant === 'light' ? 'light' : 'dark', roles }
+  } catch (e) {
+    return null
+  }
+}
+
+// The card's CSS variables for a theme. Lives in its own <style>, apart from the static
+// CSS, so the transitions there stay put and a new theme fades in.
+const themeVars = (theme) => {
+  const t = theme || FALLBACK_THEME
+  const role = (r) => t.roles[r] || FALLBACK_THEME.roles[r]
+  const vars = Object.entries(ROLES).map(([name, r]) => `--tov-${name}: ${role(r)};`)
+  const light = t.variant === 'light'
+  return `.tov {
+  ${vars.join('\n  ')}
+  --tov-track: color-mix(in srgb, ${role('fg')} ${light ? 12 : 15}%, transparent);
+  --tov-shadow: 0 0 15px color-mix(in srgb, ${light ? '#000000' : role('fg-subtle')} ${light ? 14 : 21}%, transparent);
+  color-scheme: ${t.variant};
+}`
+}
 
 export const className = `
   top: ${POSITION.top};
@@ -163,7 +244,10 @@ export const init = (dispatch) => {
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
-export const initialState = { jobs: [], connection: 'connecting', now: Date.now() }
+export const initialState = {
+  jobs: [], connection: 'connecting', now: Date.now(),
+  theme: (typeof window !== 'undefined' && window.__jobOverview && window.__jobOverview.theme) || null,
+}
 
 // Cards the server no longer knows about but that are still on screen.
 const isLocalOnly = (job) => job.leaving || job.finished
@@ -217,6 +301,13 @@ export const updateState = (event, state) => {
 
     case 'tov/remove':
       return { ...state, jobs: state.jobs.filter((j) => !(j.id === event.id && j.leaving)) }
+
+    case 'UB/COMMAND_RAN': {
+      const theme = event.error ? null : parseTheme(event.output)
+      if (!theme) return state
+      runtime.theme = theme // kept across a reload, so the next theme fades in from it
+      return { ...state, theme }
+    }
 
     case 'tov/tick': {
       // Only re-render when something on screen shows a running clock.
@@ -310,9 +401,10 @@ const Card = ({ job, connection, now }) => {
   )
 }
 
-export const render = ({ jobs, connection, now }) => (
+export const render = ({ jobs, connection, now, theme }) => (
   <div className="tov">
     <style>{CSS}</style>
+    <style>{themeVars(theme)}</style>
     <ul className="tov-list">
       {jobs.map((job) => (
         <Card key={job.id} job={job} connection={connection} now={now} />
@@ -324,21 +416,14 @@ export const render = ({ jobs, connection, now }) => (
 // Every selector is scoped under .tov so nothing leaks into other widgets.
 const CSS = `
 .tov {
-  --tov-card-bg: ${THEME.cardBg};
-  --tov-text: ${THEME.textPrimary};
-  --tov-text-2: ${THEME.textSecondary};
-  --tov-accent: ${THEME.accent};
-  --tov-done: ${THEME.done};
-  --tov-stale: ${THEME.stale};
-  --tov-track: ${THEME.track};
-  --tov-radius: ${THEME.radius};
-  --tov-shadow: ${THEME.shadow};
+  --tov-radius: ${RADIUS};
   width: ${CARD_WIDTH}px;
   font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
   color: var(--tov-text);
   -webkit-font-smoothing: antialiased;
 }
 .tov *, .tov *::before, .tov *::after { box-sizing: border-box; }
+.tov, .tov * { transition: background-color 350ms ease, color 350ms ease, border-color 350ms ease; }
 .tov-list { list-style: none; margin: 0; padding: 0; }
 
 /* Collapsing wrapper: animating grid rows 1fr -> 0fr shrinks the card's real height. */
@@ -360,7 +445,7 @@ const CSS = `
   border-radius: var(--tov-radius);
   box-shadow: var(--tov-shadow);
   animation: tov-enter 600ms cubic-bezier(0.16, 1, 0.3, 1);
-  transition: box-shadow 200ms ease;
+  transition: box-shadow 200ms ease, background-color 350ms ease, color 350ms ease;
 }
 .tov-is-stale .tov-card { box-shadow: var(--tov-shadow), inset 0 0 0 1px var(--tov-stale); }
 .tov-is-done .tov-card { box-shadow: var(--tov-shadow), inset 0 0 0 1px var(--tov-done); }

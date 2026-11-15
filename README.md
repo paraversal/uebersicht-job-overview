@@ -55,7 +55,19 @@ See the [Python README](python/README.md#stale-jobs) for exactly how staleness i
 ## Configuration
 
 Settings are at the top of `widget/job-overview.widget/index.jsx`: server URL,
-position, card width, spacing and the colour theme (Gruvbox dark by default).
+position, card width and spacing.
+
+Colours come from the global theme index in `~/.config/themes` (Base24 schemes with
+semantic roles) when you have one: the theme apps set to "System" show for the current
+macOS appearance, or the id in `THEME_CHOICE`. The widget reads the theme when it
+starts. To follow a theme switch, reload just this widget, e.g. from a theme-switcher
+hook; the cards fade to the new colours:
+
+```bash
+osascript -e 'tell application id "tracesOf.Uebersicht" to reload widget id "job-overview-widget-index-jsx"'
+```
+
+Without a theme index the cards use Gruvbox dark.
 
 ## Development
 
