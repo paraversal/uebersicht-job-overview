@@ -45,6 +45,25 @@ You can also manage jobs by hand: `job = await notifier.new_job(...)`, then
 - `notifier.job(...)` ends the card when the block exits, including on an exception.
 - `end_all_jobs()` ends every job created by that notifier (not other processes' jobs).
 
+### When a card is removed
+
+Dismissing a card in the widget removes the job on the server. The process that owns
+the job is told as well, so the job is dropped from its open set and is **not**
+re-created after a reconnect. Pass `on_job_removed` to react:
+
+```python
+async def on_removed(job_id: str, reason: str) -> None:
+    print(f"{job_id} was {reason}")  # "dismissed" or "ended"
+
+async with Notifier(on_job_removed=on_removed) as notifier:
+    ...
+```
+
+Your own `job.end()` does not call it (the job is already gone locally). With
+`SyncNotifier` the callback runs on its reader thread, so hand long work off to a
+queue. A dismissal that happens while the process is disconnected cannot be observed:
+there is no message to receive, and the job is re-created when the process reconnects.
+
 ## Stale jobs
 
 If your process dies, gets killed or hangs while a job is open, the card is marked

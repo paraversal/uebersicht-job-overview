@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -126,6 +127,81 @@ async def test_widget_dismiss(server: Server) -> None:
         await w.send(json.dumps({"type": "dismissJob", "id": job.id}))
         assert await recv(w) == {"type": "jobRemoved", "id": job.id, "reason": "dismissed"}
         assert job.id not in server.jobs
+
+
+async def test_widget_dismiss_notifies_owner(server: Server) -> None:
+    w = await widget(server)
+    owner = await connect(f"ws://127.0.0.1:{server.port}")
+    await owner.send(json.dumps({"type": "hello", "role": "producer", "protocol": 1, "clientId": "owner"}))
+    await owner.send(json.dumps({"type": "newJob", "job": {"id": "d1", "title": "Dismiss me"}}))
+    assert (await recv(w))["type"] == "jobUpserted"
+
+    await w.send(json.dumps({"type": "dismissJob", "id": "d1"}))
+    assert await recv(w) == {"type": "jobRemoved", "id": "d1", "reason": "dismissed"}
+    # The owner hears about it too, so its reconnect cannot resurrect the job.
+    assert await recv(owner) == {"type": "jobRemoved", "id": "d1", "reason": "dismissed"}
+    await owner.close()
+
+
+async def test_own_end_does_not_fire_removal_callback(server: Server) -> None:
+    seen: list[tuple[str, str]] = []
+    async with notifier(server, on_job_removed=lambda i, r: seen.append((i, r))) as n:
+        job = await n.new_job("Mine")
+        await job.end()
+        await asyncio.sleep(0.1)
+        assert seen == []
+        assert job.id not in n._jobs
+
+
+async def test_removed_job_is_dropped_and_not_replayed() -> None:
+    srv, task = await start_server()
+    port = srv.port
+    seen: list[tuple[str, str]] = []
+    n = Notifier("127.0.0.1", port, spawn_server=False, on_job_removed=lambda i, r: seen.append((i, r)))
+    await n.connect()
+    dismissed = await n.new_job("Dismiss me", id="dismissed")
+    kept = await n.new_job("Kept", id="kept")
+    await wait_for(lambda: {"dismissed", "kept"} <= set(srv.jobs))
+
+    w = await widget(srv)
+    await w.send(json.dumps({"type": "dismissJob", "id": dismissed.id}))
+    assert await recv(w) == {"type": "jobRemoved", "id": dismissed.id, "reason": "dismissed"}
+    await wait_for(lambda: seen == [(dismissed.id, "dismissed")])
+
+    srv.stop()
+    await task
+    srv2, task2 = await start_server(port)
+    # The surviving job comes back; the dismissed one must not.
+    await wait_for(lambda: kept.id in srv2.jobs)
+    assert dismissed.id not in srv2.jobs
+    await n.close()
+    srv2.stop()
+    await task2
+
+
+async def test_sync_notifier_removal_callback(server: Server) -> None:
+    seen: list[tuple[str, str]] = []
+    ready = threading.Event()
+    release = threading.Event()
+
+    def run() -> None:
+        with SyncNotifier(
+            "127.0.0.1", server.port, spawn_server=False, on_job_removed=lambda i, r: seen.append((i, r))
+        ) as n:
+            n.new_job("Sync dismiss", id="sync-dismiss")
+            ready.set()
+            release.wait(5)
+
+    worker = asyncio.create_task(asyncio.to_thread(run))
+    await wait_for(lambda: "sync-dismiss" in server.jobs)
+    await asyncio.to_thread(ready.wait, 3)
+    w = await widget(server)
+    await w.send(json.dumps({"type": "dismissJob", "id": "sync-dismiss"}))
+    assert await recv(w) == {"type": "jobRemoved", "id": "sync-dismiss", "reason": "dismissed"}
+    await wait_for(lambda: seen == [("sync-dismiss", "dismissed")])
+    assert "sync-dismiss" not in server.jobs
+    release.set()
+    await worker
 
 
 async def test_widget_resync(server: Server) -> None:

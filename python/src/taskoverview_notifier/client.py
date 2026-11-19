@@ -14,7 +14,7 @@ import logging
 import threading
 import time
 import uuid
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import dataclass
 from types import TracebackType
 from typing import Any, Self
@@ -75,11 +75,16 @@ class _NotifierBase:
         *,
         spawn_server: bool = True,
         client_id: str | None = None,
+        on_job_removed: Callable[[str, str], None] | None = None,
     ) -> None:
         self.host = host
         self.port = port
         self.spawn_server = spawn_server
         self.client_id = client_id or uuid.uuid4().hex
+        # Called when a job this client still owns is removed elsewhere (a display
+        # dismissed it, or another connection with the same client id ended it).
+        # Not called for the client's own end_job: that job is already gone locally.
+        self._on_job_removed = on_job_removed
         self._jobs: dict[str, _JobRecord] = {}
         # Jobs ended while disconnected; their endJob is sent after reconnecting.
         self._unsent_ends: set[str] = set()
@@ -145,14 +150,33 @@ class _NotifierBase:
                     setattr(record, key, value)
         return msg
 
-    @staticmethod
-    def _log_server_message(raw: str | bytes) -> None:
+    def _receive_removal(self, job_id: str, reason: str) -> None:
+        """Drop a job the server removed and tell the caller, unless it was our own end.
+
+        An endJob we sent already removed the record locally, so its echo from the
+        server must not look like an external dismissal.
+        """
+        record = self._jobs.pop(job_id, None)
+        self._unsent_ends.discard(job_id)
+        if record is None or self._on_job_removed is None:
+            return
+        try:
+            self._on_job_removed(job_id, reason)
+        except Exception:  # noqa: BLE001 — a callback must not kill the reader loop
+            logger.exception("on_job_removed callback failed")
+
+    def _log_server_message(self, raw: str | bytes) -> None:
         try:
             msg = json.loads(raw)
         except ValueError:
             return
-        if msg.get("type") == "error":
+        kind = msg.get("type")
+        if kind == "error":
             logger.warning("Job Overview server rejected a message: %s", msg.get("message"))
+        elif kind == "jobRemoved":
+            job_id = msg.get("id")
+            if isinstance(job_id, str):
+                self._receive_removal(job_id, str(msg.get("reason") or ""))
 
 
 # --- asyncio ------------------------------------------------------------------
@@ -182,6 +206,11 @@ class Job:
 
 class Notifier(_NotifierBase):
     """Asyncio client.
+
+    ``on_job_removed(job_id, reason)`` runs on the event loop when a job this client
+    still owns is removed elsewhere (a display dismissed it, or another connection
+    with the same client id ended it). The job is dropped and is not re-sent after a
+    reconnect; your own ``end_job`` does not call the callback.
 
     >>> async with Notifier() as notifier:
     ...     async with notifier.job("Downloading", "model.bin") as job:
@@ -351,6 +380,11 @@ class SyncJob:
 class SyncNotifier(_NotifierBase):
     """Blocking client, for scripts that don't use asyncio.
 
+    ``on_job_removed(job_id, reason)`` runs on the reader thread when a job this
+    client still owns is removed elsewhere; hand work off to your own queue if it is
+    long. The job is dropped and is not re-sent after a reconnect; your own
+    ``end_job`` does not call the callback.
+
     >>> with SyncNotifier() as notifier:
     ...     with notifier.job("Rendering") as job:
     ...         job.update(progress=0.5)
@@ -430,6 +464,12 @@ class SyncNotifier(_NotifierBase):
                     delay = min(delay * 2, RECONNECT_MAX)
         finally:
             self._reconnecting = False
+
+    def _log_server_message(self, raw: str | bytes) -> None:
+        # The reader thread drops removed jobs from _jobs; the caller thread reads it
+        # under this lock when it re-sends open jobs after a reconnect.
+        with self._lock:
+            super()._log_server_message(raw)
 
     def _send(self, msg: dict[str, Any]) -> None:
         if self._closed:

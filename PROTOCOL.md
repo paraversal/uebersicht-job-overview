@@ -10,6 +10,8 @@ There are two kinds of clients:
 
 The **server owns the job list**. Widgets receive a full snapshot when they
 connect and incremental changes afterwards, so a widget reload never loses state.
+When a job is removed, the server tells the widgets **and the producer that owns
+it**, so a reconnect cannot re-create a job the user dismissed.
 
 ## Handshake
 
@@ -78,6 +80,19 @@ dismissed or ended.
 | `snapshot`    | `jobs: Job[]`, `serverTime`             |
 | `jobUpserted` | `job: Job`                              |
 | `jobRemoved`  | `id`, `reason`: `"ended"` (its producer finished it) or `"dismissed"` (a widget removed it) |
+
+## Server → producer
+
+| type         | fields                                                    |
+|--------------|-----------------------------------------------------------|
+| `jobRemoved` | `id`, `reason`: `"ended"` or `"dismissed"`                 |
+
+Sent to the connection(s) of the producer that owns the job whenever the job is
+removed — by a widget's `dismissJob`, by an `endJob`/`endAllJobs`, or by another
+connection using the same `clientId`. The echo of a producer's own `endJob` is
+expected and should be ignored. A client that receives it should drop the job from
+its open set, otherwise its reconnect replay would re-create the job. Older clients
+ignore unknown message types, so this addition does not change the protocol version.
 
 ## Server → any client
 

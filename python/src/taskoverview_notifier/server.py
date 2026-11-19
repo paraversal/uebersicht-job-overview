@@ -283,8 +283,16 @@ class Server:
             self._publish(job)
 
     def _remove(self, job_id: str, reason: Literal["ended", "dismissed"]) -> None:
-        if self.jobs.pop(job_id, None) is not None:
-            broadcast(self.widgets, json.dumps({"type": "jobRemoved", "id": job_id, "reason": reason}))
+        job = self.jobs.pop(job_id, None)
+        if job is None:
+            return
+        message = json.dumps({"type": "jobRemoved", "id": job_id, "reason": reason})
+        broadcast(self.widgets, message)
+        # The owner must know too: otherwise a display dismissal is undone the next
+        # time its client reconnects and re-sends its open jobs.
+        owners = self.producers.get(job.owner)
+        if owners:
+            broadcast(owners, message)
 
     def _publish(self, job: JobState) -> None:
         broadcast(self.widgets, json.dumps({"type": "jobUpserted", "job": job.to_wire()}))
